@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import timm
 
 
 def squash(inputs: torch.Tensor, axis: int = -1, eps: float = 1e-9) -> torch.Tensor:
@@ -19,6 +20,7 @@ class CapsuleLayer(nn.Module):
     input : [B, N_in, D_in]
     output: [B, N_out, D_out]
     """
+
     def __init__(
         self,
         num_capsules: int,
@@ -43,13 +45,9 @@ class CapsuleLayer(nn.Module):
         # x: [B, N_in, D_in]
         bsz = x.size(0)
         if x.size(1) != self.num_route_nodes:
-            raise ValueError(
-                f"Expected N_in={self.num_route_nodes}, got {x.size(1)}"
-            )
+            raise ValueError(f"Expected N_in={self.num_route_nodes}, got {x.size(1)}")
         if x.size(2) != self.in_channels:
-            raise ValueError(
-                f"Expected D_in={self.in_channels}, got {x.size(2)}"
-            )
+            raise ValueError(f"Expected D_in={self.in_channels}, got {x.size(2)}")
 
         # u_hat: [B, N_out, N_in, D_out]
         u_hat = torch.einsum("oidc,bic->boid", self.W, x)
@@ -74,247 +72,34 @@ class CapsuleLayer(nn.Module):
         return v_j
 
 
-class ConvBNReLU(nn.Module):
-    def __init__(self, c_in: int, c_out: int, k: int = 3, s: int = 1, p: int = 1):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(c_in, c_out, kernel_size=k, stride=s, padding=p, bias=False),
-            nn.BatchNorm2d(c_out),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
-class BasicBlock(nn.Module):
-    """
-    Lightweight residual block (2x 3x3 conv).
-    """
-    expansion = 1
-
-    def __init__(self, c_in: int, c_out: int, stride: int = 1):
-        super().__init__()
-        self.conv1 = ConvBNReLU(c_in, c_out, k=3, s=stride, p=1)
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(c_out, c_out, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(c_out),
-        )
-        self.relu = nn.ReLU(inplace=True)
-
-        if stride != 1 or c_in != c_out:
-            self.downsample = nn.Sequential(
-                nn.Conv2d(c_in, c_out, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(c_out),
-            )
-        else:
-            self.downsample = nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = self.downsample(x)
-        out = self.conv1(x)
-        out = self.conv2(out)
-        out = out + identity
-        out = self.relu(out)
-        return out
-
-
-def _make_branch(c_in: int, c_out: int, num_blocks: int = 2) -> nn.Sequential:
-    blocks = [BasicBlock(c_in, c_out, stride=1)]
-    for _ in range(num_blocks - 1):
-        blocks.append(BasicBlock(c_out, c_out, stride=1))
-    return nn.Sequential(*blocks)
-
-
-class HRNetStage(nn.Module):
-    """
-    Minimal HRNet-style multi-branch stage with repeated fusion.
-    """
-    def __init__(self, channels):
-        super().__init__()
-        # channels list, one per branch
-        self.channels = channels
-        self.num_branches = len(channels)
-
-        self.branches = nn.ModuleList(
-            [_make_branch(ch, ch, num_blocks=2) for ch in channels]
-        )
-
-        # fuse layers: each target i receives sum of transformed source j
-        self.fuse_layers = nn.ModuleList()
-        for i in range(self.num_branches):
-            fuse_row = nn.ModuleList()
-            for j in range(self.num_branches):
-                if i == j:
-                    fuse_row.append(nn.Identity())
-                elif j > i:
-                    # upsample from lower-res j to higher-res i
-                    fuse_row.append(
-                        nn.Sequential(
-                            nn.Conv2d(channels[j], channels[i], kernel_size=1, bias=False),
-                            nn.BatchNorm2d(channels[i]),
-                        )
-                    )
-                else:
-                    # downsample from higher-res j to lower-res i
-                    ops = []
-                    in_ch = channels[j]
-                    for k in range(i - j):
-                        out_ch = channels[i] if k == (i - j - 1) else in_ch
-                        ops.append(
-                            nn.Conv2d(
-                                in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False
-                            )
-                        )
-                        ops.append(nn.BatchNorm2d(out_ch))
-                        if k != (i - j - 1):
-                            ops.append(nn.ReLU(inplace=True))
-                        in_ch = out_ch
-                    fuse_row.append(nn.Sequential(*ops))
-            self.fuse_layers.append(fuse_row)
-
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x_list):
-        assert len(x_list) == self.num_branches, "Branch count mismatch"
-
-        # per-branch processing
-        y = [b(x) for b, x in zip(self.branches, x_list)]
-
-        # fusion
-        out = []
-        for i in range(self.num_branches):
-            fused = None
-            tgt_h, tgt_w = y[i].shape[-2:]
-            for j in range(self.num_branches):
-                z = self.fuse_layers[i][j](y[j])
-                if j > i:
-                    z = F.interpolate(z, size=(tgt_h, tgt_w), mode="nearest")
-                fused = z if fused is None else (fused + z)
-            out.append(self.relu(fused))
-        return out
-
-
-class MiniHRNetBackbone(nn.Module):
-    """
-    Paper-aligned behavior (without external HRNet dependency):
-    - input 299x299x3
-    - two 3x3 stride-2 stem convolutions
-    - parallel high-to-low resolution branches with repeated fusions
-    - no final global pooling
-    - output feature map fixed to 64x56x56
-    """
-    def __init__(self):
-        super().__init__()
-
-        # Stem: 299 -> 150 -> 75
-        self.conv1 = ConvBNReLU(3, 64, k=3, s=2, p=1)
-        self.conv2 = ConvBNReLU(64, 64, k=3, s=2, p=1)
-
-        # Stage 1 (single high-res branch)
-        self.stage1 = _make_branch(64, 64, num_blocks=2)
-
-        # Transition to 2 branches
-        self.transition1 = nn.ModuleList([
-            nn.Identity(),  # branch 0: 64, 75x75
-            nn.Sequential(  # branch 1: 128, 38x38
-                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(128),
-                nn.ReLU(inplace=True),
-            ),
-        ])
-        self.stage2 = HRNetStage([64, 128])
-
-        # Transition to 3 branches
-        self.transition2 = nn.ModuleList([
-            nn.Identity(),  # keep 64
-            nn.Identity(),  # keep 128
-            nn.Sequential(  # new branch: 256, 19x19
-                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(256),
-                nn.ReLU(inplace=True),
-            ),
-        ])
-        self.stage3 = HRNetStage([64, 128, 256])
-
-        # Transition to 4 branches
-        self.transition3 = nn.ModuleList([
-            nn.Identity(),  # keep 64
-            nn.Identity(),  # keep 128
-            nn.Identity(),  # keep 256
-            nn.Sequential(  # new branch: 512, 10x10
-                nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(512),
-                nn.ReLU(inplace=True),
-            ),
-        ])
-        self.stage4 = HRNetStage([64, 128, 256, 512])
-
-        # Fuse multi-scale concatenation -> 64 channels
-        self.fuse_proj = nn.Sequential(
-            nn.Conv2d(64 + 128 + 256 + 512, 128, kernel_size=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 64, kernel_size=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.stage1(x)
-
-        x_list = [self.transition1[0](x), self.transition1[1](x)]
-        y_list = self.stage2(x_list)
-
-        x_list = [self.transition2[0](y_list[0]), self.transition2[1](y_list[1]), self.transition2[2](y_list[1])]
-        y_list = self.stage3(x_list)
-
-        x_list = [
-            self.transition3[0](y_list[0]),
-            self.transition3[1](y_list[1]),
-            self.transition3[2](y_list[2]),
-            self.transition3[3](y_list[2]),
-        ]
-        y_list = self.stage4(x_list)
-
-        # Upsample all branches to highest resolution branch
-        h, w = y_list[0].shape[-2:]
-        y0 = y_list[0]
-        y1 = F.interpolate(y_list[1], size=(h, w), mode="nearest")
-        y2 = F.interpolate(y_list[2], size=(h, w), mode="nearest")
-        y3 = F.interpolate(y_list[3], size=(h, w), mode="nearest")
-        y = torch.cat([y0, y1, y2, y3], dim=1)
-        y = self.fuse_proj(y)  # [B,64,h,w]
-
-        # Paper target feature map for downstream capsule fusion
-        y = F.interpolate(y, size=(56, 56), mode="bilinear", align_corners=False)
-        return y  # [B,64,56,56]
-
-
 class LBPBlock(nn.Module):
     """
     Local binary pattern-style maps (8-neighbor comparator) per channel.
     """
+
     def __init__(self):
         super().__init__()
         self.offsets = [
-            (-1, -1), (-1, 0), (-1, 1),
-            (0, -1),            (0, 1),
-            (1, -1),  (1, 0),   (1, 1),
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
         ]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B,C,H,W]
-        b, c, h, w = x.shape
+        _, _, h, w = x.shape
         xp = F.pad(x, (1, 1, 1, 1), mode="reflect")
-        center = xp[:, :, 1:1 + h, 1:1 + w]
+        center = xp[:, :, 1 : 1 + h, 1 : 1 + w]
         outs = []
         for dy, dx in self.offsets:
             yy = 1 + dy
             xx = 1 + dx
-            nbr = xp[:, :, yy:yy + h, xx:xx + w]
+            nbr = xp[:, :, yy : yy + h, xx : xx + w]
             outs.append((nbr >= center).to(x.dtype))
         return torch.cat(outs, dim=1)  # [B, 8C, H, W]
 
@@ -323,6 +108,7 @@ class ConvPrimaryCaps(nn.Module):
     """
     Primary capsule projection from fused feature map.
     """
+
     def __init__(self, in_channels: int, num_capsules: int = 8, capsule_dim: int = 8):
         super().__init__()
         self.num_capsules = num_capsules
@@ -347,17 +133,79 @@ class ConvPrimaryCaps(nn.Module):
         return x
 
 
+class TimmHRNetBackbone(nn.Module):
+    """
+    HRNet backbone using external timm implementation.
+
+    - Uses timm feature extraction API (`features_only=True`)
+    - Removes classification head behavior by consuming intermediate features
+    - Produces fixed feature map [B, 64, 56, 56] for capsule fusion
+    """
+
+    def __init__(self, model_name: str = "hrnet_w18", pretrained: bool = False):
+        super().__init__()
+        self.model_name = model_name
+
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(0, 1, 2, 3, 4),
+        )
+
+        feat_info = self.backbone.feature_info.get_dicts()
+        self.feature_channels = [d["num_chs"] for d in feat_info]
+
+        # Aggregate all selected feature maps into one tensor and project to 64 channels
+        in_ch = sum(self.feature_channels)
+        self.fuse_proj = nn.Sequential(
+            nn.Conv2d(in_ch, 256, kernel_size=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # timm HRNet can hit branch-fusion mismatches on non-aligned spatial sizes (e.g., 299x299).
+        # Pad to the next multiple of 32 before backbone forward, then keep downstream fixed to 56x56.
+        h, w = x.shape[-2:]
+        pad_h = (32 - (h % 32)) % 32
+        pad_w = (32 - (w % 32)) % 32
+        if pad_h != 0 or pad_w != 0:
+            x_safe = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+        else:
+            x_safe = x
+
+        feats = self.backbone(x_safe)  # list of feature maps low->high semantic
+
+        # Choose highest spatial resolution among outputs as fusion target
+        target_h, target_w = feats[0].shape[-2:]
+        resized = [
+            F.interpolate(f, size=(target_h, target_w), mode="nearest")
+            if f.shape[-2:] != (target_h, target_w)
+            else f
+            for f in feats
+        ]
+        y = torch.cat(resized, dim=1)
+        y = self.fuse_proj(y)
+        y = F.interpolate(y, size=(56, 56), mode="bilinear", align_corners=False)
+        return y  # [B,64,56,56]
+
+
 class HRNetLBPCapsNet(nn.Module):
     """
-    Paper-aligned architecture (practical implementation):
-      1) HRNet-style high-resolution backbone (no final pooling)
+    Paper-aligned architecture (external HRNet variant):
+      1) timm HRNet high-resolution backbone (no classifier head path)
       2) LBP texture extraction in HSV + YCbCr spaces
-      3) Feature fusion: HRNet(64x56x56) + texture(6x56x56) -> 70x56x56
+      3) Feature fusion: HRNet(64x56x56) + texture(6x56x56)
       4) Capsule classification via routing-by-agreement
 
     Output:
       class capsule lengths [B, num_classes]
     """
+
     def __init__(
         self,
         num_classes: int = 2,
@@ -365,12 +213,16 @@ class HRNetLBPCapsNet(nn.Module):
         primary_dim: int = 8,
         digit_dim: int = 16,
         routing_iters: int = 3,
+        hrnet_name: str = "hrnet_w18",
+        hrnet_pretrained: bool = False,
     ):
         super().__init__()
         self.num_classes = num_classes
 
-        # HRNet-like feature extractor (no external dependency)
-        self.hrnet = MiniHRNetBackbone()
+        # External HRNet backbone
+        self.hrnet = TimmHRNetBackbone(
+            model_name=hrnet_name, pretrained=hrnet_pretrained
+        )
         self.lbp = LBPBlock()
 
         # LBP over 3 channels => 24 maps per space; combine HSV + YCbCr -> averaged 24 maps
@@ -445,8 +297,8 @@ class HRNetLBPCapsNet(nn.Module):
         hsv = self._rgb_to_hsv(x01)
         ycbcr = self._rgb_to_ycbcr(x01)
 
-        lbp_hsv = self.lbp(hsv)      # [B,24,H,W]
-        lbp_ycc = self.lbp(ycbcr)    # [B,24,H,W]
+        lbp_hsv = self.lbp(hsv)  # [B,24,H,W]
+        lbp_ycc = self.lbp(ycbcr)  # [B,24,H,W]
 
         lbp_hsv = F.interpolate(lbp_hsv, size=(56, 56), mode="nearest")
         lbp_ycc = F.interpolate(lbp_ycc, size=(56, 56), mode="nearest")
@@ -456,13 +308,13 @@ class HRNetLBPCapsNet(nn.Module):
         return tex
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hr = self.hrnet(x)                 # [B,64,56,56]
-        tex = self._texture_features(x)    # [B,6,56,56]
+        hr = self.hrnet(x)  # [B,64,56,56]
+        tex = self._texture_features(x)  # [B,6,56,56]
 
         feat = self.fusion(torch.cat([hr, tex], dim=1))  # [B,64,56,56]
 
-        pri = self.primary_caps(feat)      # [B,N_in,8]
-        dig = self.digit_caps(pri)         # [B,num_classes,16]
+        pri = self.primary_caps(feat)  # [B,N_in,8]
+        dig = self.digit_caps(pri)  # [B,num_classes,16]
 
         lengths = torch.norm(dig, dim=-1)  # [B,num_classes]
         return lengths
@@ -473,7 +325,7 @@ SegCapsCNN = HRNetLBPCapsNet
 
 
 if __name__ == "__main__":
-    model = HRNetLBPCapsNet(num_classes=2)
+    model = HRNetLBPCapsNet(num_classes=2, hrnet_name="hrnet_w18", hrnet_pretrained=False)
     dummy = torch.rand(2, 3, 299, 299)
     out = model(dummy)
     print("Output shape:", out.shape)  # expected: [2, 2]
